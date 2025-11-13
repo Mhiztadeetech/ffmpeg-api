@@ -1,13 +1,13 @@
 const express = require('express');
-const ytdl = require('yt-dlp-exec');
-const ffmpeg = require('fluent-ffmpeg');
-const axios = require('axios');
+const { exec } = require('child_process');
+const util = require('util');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const execPromise = util.promisify(exec);
 
 // Middleware
 app.use(express.json());
@@ -15,22 +15,30 @@ app.use(express.urlencoded({ extended: true }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'ffmpeg-api', version: '1.0.0' });
+  res.json({ 
+    status: 'healthy', 
+    service: 'ffmpeg-api', 
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
 });
 
-// YouTube download endpoint (matches what n8n expects)
+// YouTube download endpoint
 app.post('/', async (req, res) => {
+  let jobId;
+  let outputPath;
+  
   try {
     const {
       url,
-      format = 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+      format = 'best[height<=720]',
       quality = '720p',
       maxDuration = 60,
       title,
       channel
     } = req.body;
 
-    console.log('Download request received:', { url, format, quality, maxDuration });
+    console.log('Download request received:', { url, format, quality });
 
     if (!url) {
       return res.status(400).json({
@@ -40,41 +48,39 @@ app.post('/', async (req, res) => {
     }
 
     // Generate unique job ID
-    const jobId = uuidv4();
-    const outputPath = `/tmp/${jobId}_output.mp4`;
+    jobId = uuidv4();
+    outputPath = `/tmp/${jobId}_%(title)s.%(ext)s`;
 
     try {
-      // Download video using yt-dlp
       console.log(`[${jobId}] Starting YouTube download...`);
-      
-      await ytdl(url, {
-        format: format,
-        output: outputPath,
-        maxFilesize: '100M',
-        noCheckCertificates: true,
-        noWarnings: true,
-        preferFreeFormats: true,
-        addHeader: [
-          '--referer', 'https://www.youtube.com/',
-          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        ]
-      });
 
-      // Check if file was created
-      if (!fs.existsSync(outputPath)) {
-        throw new Error('Downloaded file not found');
+      // Build yt-dlp command
+      const command = `yt-dlp -f "${format}" --max-filesize 100M --no-check-certificate "${url}" -o "${outputPath}"`;
+
+      console.log(`[${jobId}] Executing: ${command}`);
+      
+      const { stdout, stderr } = await execPromise(command);
+      
+      console.log(`[${jobId}] Download stdout: ${stdout}`);
+      if (stderr) console.log(`[${jobId}] Download stderr: ${stderr}`);
+
+      // Find the actual downloaded file
+      const files = fs.readdirSync('/tmp').filter(file => file.includes(jobId));
+      if (files.length === 0) {
+        throw new Error('No downloaded file found');
       }
 
-      const stats = fs.statSync(outputPath);
+      const actualFilePath = path.join('/tmp', files[0]);
+      const stats = fs.statSync(actualFilePath);
       const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
       console.log(`[${jobId}] Download completed: ${fileSizeMB}MB`);
 
-      // Return success response (n8n format)
+      // Return success response
       res.json({
         success: true,
         jobId: jobId,
-        downloadedFile: outputPath,
+        downloadedFile: actualFilePath,
         fileSizeMB: parseFloat(fileSizeMB),
         title: title,
         channel: channel,
@@ -84,8 +90,8 @@ app.post('/', async (req, res) => {
 
       // Cleanup after 5 minutes
       setTimeout(() => {
-        if (fs.existsSync(outputPath)) {
-          fs.unlinkSync(outputPath);
+        if (fs.existsSync(actualFilePath)) {
+          fs.unlinkSync(actualFilePath);
           console.log(`[${jobId}] Cleaned up temporary file`);
         }
       }, 300000);
@@ -100,14 +106,19 @@ app.post('/', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message,
+      jobId: jobId || 'unknown',
       details: 'Failed to download video from YouTube'
     });
   }
 });
 
-// Your existing process-video endpoint (keep for other processing)
-app.post('/process-video', async (req, res) => {
-  // ... keep your existing process-video code here
+// Simple test endpoint
+app.post('/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'API is working',
+    received: req.body
+  });
 });
 
 // Start server
