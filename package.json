@@ -1,5 +1,5 @@
 {
-  "name": "yt-dlp-api",
+  "name": "youtube-download-api",
   "version": "1.0.0",
   "description": "YouTube Download API for n8n",
   "main": "server.js",
@@ -9,7 +9,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "uuid": "^9.0.1",
-    "youtube-dl-exec": "^2.1.3"
+    "ytdl-core": "^4.11.5"
   },
   "engines": {
     "node": "18.x"
