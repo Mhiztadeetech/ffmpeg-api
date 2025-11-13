@@ -1,10 +1,14 @@
 FROM node:18-alpine3.19
 
-# Install FFmpeg
-RUN apk add --no-cache ffmpeg
+# Install system dependencies including yt-dlp and ffmpeg
+RUN apk add --no-cache \
+    python3 \
+    py3-pip \
+    ffmpeg \
+    && pip3 install yt-dlp
 
 # Create app directory
-WORKDIR /usr/src/app
+WORKDIR /user/src/app
 
 # Set production environment
 ENV NODE_ENV=production
