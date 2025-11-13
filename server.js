@@ -1,13 +1,11 @@
 const express = require('express');
-const { exec } = require('child_process');
-const util = require('util');
+const youtubedl = require('youtube-dl-exec');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const execPromise = util.promisify(exec);
 
 // Middleware
 app.use(express.json());
@@ -23,23 +21,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Test yt-dlp availability
-app.get('/test-ytdlp', async (req, res) => {
-  try {
-    const { stdout, stderr } = await execPromise('which yt-dlp || echo "yt-dlp not found"');
-    res.json({
-      ytdlpAvailable: stdout.includes('yt-dlp'),
-      path: stdout.trim(),
-      stderr: stderr
-    });
-  } catch (error) {
-    res.json({
-      ytdlpAvailable: false,
-      error: error.message
-    });
-  }
-});
-
 // YouTube download endpoint
 app.post('/', async (req, res) => {
   let jobId;
@@ -48,7 +29,8 @@ app.post('/', async (req, res) => {
     const {
       url,
       format = 'best[height<=720]',
-      quality = '720p'
+      quality = '720p',
+      maxDuration = 60
     } = req.body;
 
     console.log('Download request received:', { url, format, quality });
@@ -62,7 +44,7 @@ app.post('/', async (req, res) => {
 
     // Generate unique job ID
     jobId = uuidv4();
-    const outputPath = `./tmp/${jobId}`;
+    const outputPath = `./tmp/${jobId}.%(ext)s`;
 
     // Ensure tmp directory exists
     if (!fs.existsSync('./tmp')) {
@@ -72,52 +54,46 @@ app.post('/', async (req, res) => {
     try {
       console.log(`[${jobId}] Starting YouTube download...`);
 
-      // Build yt-dlp command - try different approaches
-      const commands = [
-        `yt-dlp -f "${format}" --max-filesize 100M "${url}" -o "${outputPath}.%(ext)s"`,
-        `python3 -m yt_dlp -f "${format}" --max-filesize 100M "${url}" -o "${outputPath}.%(ext)s"`
-      ];
+      // Download using youtube-dl-exec (Node.js native)
+      const result = await youtubedl(url, {
+        format: format,
+        output: outputPath,
+        maxFilesize: '100M',
+        noCheckCertificates: true,
+        noWarnings: true,
+        preferFreeFormats: true,
+        addHeader: [
+          '--referer', 'https://www.youtube.com/',
+          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
+      });
 
-      let lastError;
-      
-      for (const command of commands) {
-        try {
-          console.log(`[${jobId}] Trying: ${command}`);
-          const { stdout, stderr } = await execPromise(command);
-          console.log(`[${jobId}] Success with command`);
-          break;
-        } catch (error) {
-          lastError = error;
-          console.log(`[${jobId}] Command failed: ${error.message}`);
-          continue;
-        }
-      }
-
-      if (lastError && !fs.existsSync(`${outputPath}.mp4`) && !fs.existsSync(`${outputPath}.mkv`)) {
-        throw lastError;
-      }
+      console.log(`[${jobId}] Download result:`, result);
 
       // Find the actual downloaded file
-      const downloadedFile = fs.existsSync(`${outputPath}.mp4`) ? 
-        `${outputPath}.mp4` : 
-        `${outputPath}.mkv`;
-
-      if (!fs.existsSync(downloadedFile)) {
-        throw new Error('Downloaded file not found');
+      const files = fs.readdirSync('./tmp').filter(file => file.includes(jobId));
+      if (files.length === 0) {
+        throw new Error('No downloaded file found');
       }
 
+      const downloadedFile = path.join('./tmp', files[0]);
       const stats = fs.statSync(downloadedFile);
       const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
       console.log(`[${jobId}] Download completed: ${fileSizeMB}MB`);
 
-      // For Railway, we can't serve files directly, so return success
+      // Return success response
       res.json({
         success: true,
         jobId: jobId,
         fileSizeMB: parseFloat(fileSizeMB),
-        fileName: path.basename(downloadedFile),
-        message: 'Video downloaded successfully (stored temporarily)'
+        fileName: files[0],
+        message: 'Video downloaded successfully',
+        videoInfo: {
+          url: url,
+          quality: quality,
+          format: format
+        }
       });
 
       // Cleanup after 2 minutes
@@ -144,6 +120,33 @@ app.post('/', async (req, res) => {
   }
 });
 
+// Test endpoint to check if YouTube download works
+app.post('/test-download', async (req, res) => {
+  try {
+    const testUrl = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // Famous "Me at the zoo" video
+    
+    const result = await youtubedl(testUrl, {
+      dumpJson: true,
+      noCheckCertificates: true,
+      noWarnings: true,
+    });
+
+    res.json({
+      success: true,
+      message: 'YouTube download test successful',
+      videoTitle: result.title,
+      duration: result.duration,
+      formats: result.formats ? result.formats.length : 0
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'YouTube download test failed'
+    });
+  }
+});
+
 // Simple echo endpoint for testing
 app.post('/echo', (req, res) => {
   res.json({
@@ -158,4 +161,5 @@ app.post('/echo', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`YouTube Download API running on port ${PORT}`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`Test download: POST http://0.0.0.0:${PORT}/test-download`);
 });
