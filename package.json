@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "uuid": "^9.0.1",
-    "ytdl-core": "^4.11.5"
+    "ytdl-core": "^4.11.5",
+    "yt-dlp-wrap": "^2.1.5"
   },
   "engines": {
     "node": "18.x"
