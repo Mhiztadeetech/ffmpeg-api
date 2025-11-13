@@ -1,35 +1,29 @@
-FROM node:18-alpine3.19
+FROM node:18-bullseye
 
-# Install system dependencies including yt-dlp and ffmpeg
-RUN apk add --no-cache \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
     python3 \
-    py3-pip \
+    python3-pip \
     ffmpeg \
-    && pip3 install yt-dlp
+    && pip3 install yt-dlp \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
-WORKDIR /user/src/app
+WORKDIR /app
 
-# Set production environment
-ENV NODE_ENV=production
+# Copy package files
+COPY package*.json ./
 
-# Copy package files first for better layer caching
-COPY --chown=node:node package*.json ./
-
-# Install production dependencies
+# Install Node.js dependencies
 RUN npm install --production --no-audit --no-fund
 
 # Copy app source
-COPY --chown=node:node . .
+COPY . .
 
-# Create temp directories with correct ownership
-RUN mkdir -p /tmp/uploads && chown -R node:node /tmp/uploads
+# Create tmp directory for downloads
+RUN mkdir -p /tmp
 
-# Use non-root user
-USER node
-
-# Expose port
 EXPOSE 3000
 
-# Start app
-CMD ["node", "server.js"]
+CMD [ "node", "server.js" ]
