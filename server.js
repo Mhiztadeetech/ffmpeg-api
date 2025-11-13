@@ -17,25 +17,38 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
-    service: 'ffmpeg-api', 
+    service: 'yt-dlp-api', 
     version: '1.0.0',
     timestamp: new Date().toISOString()
   });
 });
 
+// Test yt-dlp availability
+app.get('/test-ytdlp', async (req, res) => {
+  try {
+    const { stdout, stderr } = await execPromise('which yt-dlp || echo "yt-dlp not found"');
+    res.json({
+      ytdlpAvailable: stdout.includes('yt-dlp'),
+      path: stdout.trim(),
+      stderr: stderr
+    });
+  } catch (error) {
+    res.json({
+      ytdlpAvailable: false,
+      error: error.message
+    });
+  }
+});
+
 // YouTube download endpoint
 app.post('/', async (req, res) => {
   let jobId;
-  let outputPath;
   
   try {
     const {
       url,
       format = 'best[height<=720]',
-      quality = '720p',
-      maxDuration = 60,
-      title,
-      channel
+      quality = '720p'
     } = req.body;
 
     console.log('Download request received:', { url, format, quality });
@@ -49,52 +62,71 @@ app.post('/', async (req, res) => {
 
     // Generate unique job ID
     jobId = uuidv4();
-    outputPath = `/tmp/${jobId}_%(title)s.%(ext)s`;
+    const outputPath = `./tmp/${jobId}`;
+
+    // Ensure tmp directory exists
+    if (!fs.existsSync('./tmp')) {
+      fs.mkdirSync('./tmp');
+    }
 
     try {
       console.log(`[${jobId}] Starting YouTube download...`);
 
-      // Build yt-dlp command
-      const command = `yt-dlp -f "${format}" --max-filesize 100M --no-check-certificate "${url}" -o "${outputPath}"`;
+      // Build yt-dlp command - try different approaches
+      const commands = [
+        `yt-dlp -f "${format}" --max-filesize 100M "${url}" -o "${outputPath}.%(ext)s"`,
+        `python3 -m yt_dlp -f "${format}" --max-filesize 100M "${url}" -o "${outputPath}.%(ext)s"`
+      ];
 
-      console.log(`[${jobId}] Executing: ${command}`);
+      let lastError;
       
-      const { stdout, stderr } = await execPromise(command);
-      
-      console.log(`[${jobId}] Download stdout: ${stdout}`);
-      if (stderr) console.log(`[${jobId}] Download stderr: ${stderr}`);
-
-      // Find the actual downloaded file
-      const files = fs.readdirSync('/tmp').filter(file => file.includes(jobId));
-      if (files.length === 0) {
-        throw new Error('No downloaded file found');
+      for (const command of commands) {
+        try {
+          console.log(`[${jobId}] Trying: ${command}`);
+          const { stdout, stderr } = await execPromise(command);
+          console.log(`[${jobId}] Success with command`);
+          break;
+        } catch (error) {
+          lastError = error;
+          console.log(`[${jobId}] Command failed: ${error.message}`);
+          continue;
+        }
       }
 
-      const actualFilePath = path.join('/tmp', files[0]);
-      const stats = fs.statSync(actualFilePath);
+      if (lastError && !fs.existsSync(`${outputPath}.mp4`) && !fs.existsSync(`${outputPath}.mkv`)) {
+        throw lastError;
+      }
+
+      // Find the actual downloaded file
+      const downloadedFile = fs.existsSync(`${outputPath}.mp4`) ? 
+        `${outputPath}.mp4` : 
+        `${outputPath}.mkv`;
+
+      if (!fs.existsSync(downloadedFile)) {
+        throw new Error('Downloaded file not found');
+      }
+
+      const stats = fs.statSync(downloadedFile);
       const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
       console.log(`[${jobId}] Download completed: ${fileSizeMB}MB`);
 
-      // Return success response
+      // For Railway, we can't serve files directly, so return success
       res.json({
         success: true,
         jobId: jobId,
-        downloadedFile: actualFilePath,
         fileSizeMB: parseFloat(fileSizeMB),
-        title: title,
-        channel: channel,
-        originalUrl: url,
-        message: 'Video downloaded successfully'
+        fileName: path.basename(downloadedFile),
+        message: 'Video downloaded successfully (stored temporarily)'
       });
 
-      // Cleanup after 5 minutes
+      // Cleanup after 2 minutes
       setTimeout(() => {
-        if (fs.existsSync(actualFilePath)) {
-          fs.unlinkSync(actualFilePath);
+        if (fs.existsSync(downloadedFile)) {
+          fs.unlinkSync(downloadedFile);
           console.log(`[${jobId}] Cleaned up temporary file`);
         }
-      }, 300000);
+      }, 120000);
 
     } catch (downloadError) {
       console.error(`[${jobId}] Download error:`, downloadError);
@@ -112,18 +144,18 @@ app.post('/', async (req, res) => {
   }
 });
 
-// Simple test endpoint
-app.post('/test', (req, res) => {
+// Simple echo endpoint for testing
+app.post('/echo', (req, res) => {
   res.json({
     success: true,
-    message: 'API is working',
-    received: req.body
+    message: 'Request received',
+    body: req.body,
+    headers: req.headers
   });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`FFmpeg API server running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`YouTube download endpoint: POST http://localhost:${PORT}/`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`YouTube Download API running on port ${PORT}`);
+  console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
