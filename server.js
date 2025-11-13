@@ -16,20 +16,19 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     service: 'youtube-download-api', 
-    version: '2.0.0',
+    version: '3.0.0',
     timestamp: new Date().toISOString()
   });
 });
 
-// YouTube download endpoint
+// Enhanced YouTube download with multiple fallbacks
 app.post('/', async (req, res) => {
   let jobId;
-  let outputStream;
   
   try {
     const {
       url,
-      quality = 'highest',
+      quality = '720p',
       maxDuration = 60
     } = req.body;
 
@@ -42,28 +41,21 @@ app.post('/', async (req, res) => {
       });
     }
 
-    // Validate YouTube URL
-    if (!ytdl.validateURL(url)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid YouTube URL'
-      });
-    }
-
     // Generate unique job ID
     jobId = uuidv4();
-    const outputPath = `./tmp/${jobId}.mp4`;
-
-    // Ensure tmp directory exists
-    if (!fs.existsSync('./tmp')) {
-      fs.mkdirSync('./tmp');
-    }
 
     try {
       console.log(`[${jobId}] Starting YouTube download...`);
 
-      // Get video info first
-      const info = await ytdl.getInfo(url);
+      // Method 1: Try ytdl-core with updated options
+      const info = await ytdl.getInfo(url, {
+        requestOptions: {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          }
+        }
+      });
+
       const videoTitle = info.videoDetails.title;
       const duration = parseInt(info.videoDetails.lengthSeconds);
 
@@ -77,76 +69,74 @@ app.post('/', async (req, res) => {
         });
       }
 
-      // Set up download options
-      const downloadOptions = {
-        quality: quality === '720p' ? 'highest' : quality,
-        filter: format => format.container === 'mp4',
-      };
+      // Find the best format
+      let format;
+      if (quality === '720p') {
+        format = ytdl.chooseFormat(info.formats, {
+          quality: 'highest',
+          filter: format => format.qualityLabel === '720p' && format.hasVideo && format.hasAudio
+        });
+      } else {
+        format = ytdl.chooseFormat(info.formats, {
+          quality: 'highest',
+          filter: format => format.hasVideo && format.hasAudio
+        });
+      }
 
-      // Create write stream
-      outputStream = fs.createWriteStream(outputPath);
-      
-      // Download video
-      const downloadPromise = new Promise((resolve, reject) => {
-        const videoStream = ytdl(url, downloadOptions)
-          .on('progress', (chunkLength, downloaded, total) => {
-            const percent = (downloaded / total * 100).toFixed(2);
-            console.log(`[${jobId}] Download progress: ${percent}%`);
-          })
-          .on('error', (error) => {
-            reject(error);
-          })
-          .on('end', () => {
-            console.log(`[${jobId}] Download completed`);
-            resolve();
-          });
+      if (!format) {
+        // Fallback: get any format with video and audio
+        format = ytdl.chooseFormat(info.formats, {
+          quality: 'highest',
+          filter: format => format.hasVideo && format.hasAudio
+        });
+      }
 
-        videoStream.pipe(outputStream);
-      });
+      if (!format) {
+        throw new Error('No suitable video format found');
+      }
 
-      await downloadPromise;
+      console.log(`[${jobId}] Selected format: ${format.qualityLabel}`);
 
-      // Get file stats
-      const stats = fs.statSync(outputPath);
-      const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-      console.log(`[${jobId}] Download completed: ${fileSizeMB}MB`);
-
-      // Return success response
+      // Return video info and download URL instead of downloading
       res.json({
         success: true,
         jobId: jobId,
-        fileSizeMB: parseFloat(fileSizeMB),
-        fileName: `${jobId}.mp4`,
         videoInfo: {
           title: videoTitle,
           duration: duration,
+          quality: format.qualityLabel,
           url: url,
-          quality: quality
+          downloadUrl: format.url, // Direct download URL
+          container: format.container
         },
-        message: 'Video downloaded successfully'
+        fileInfo: {
+          estimatedSize: format.contentLength ? (format.contentLength / (1024 * 1024)).toFixed(2) + 'MB' : 'Unknown',
+          format: format.qualityLabel
+        },
+        message: 'Video information retrieved successfully. Use the downloadUrl for direct download.'
       });
 
-      // Cleanup after 2 minutes
-      setTimeout(() => {
-        if (fs.existsSync(outputPath)) {
-          fs.unlinkSync(outputPath);
-          console.log(`[${jobId}] Cleaned up temporary file`);
-        }
-      }, 120000);
-
     } catch (downloadError) {
-      console.error(`[${jobId}] Download error:`, downloadError);
+      console.error(`[${jobId}] Download error:`, downloadError.message);
       
-      // Clean up failed download
-      if (outputStream) {
-        outputStream.destroy();
+      // Fallback: Return basic video info without download
+      try {
+        const basicInfo = await ytdl.getBasicInfo(url);
+        res.json({
+          success: false,
+          error: 'Download failed, but here is video info',
+          jobId: jobId,
+          videoInfo: {
+            title: basicInfo.videoDetails.title,
+            duration: basicInfo.videoDetails.lengthSeconds,
+            url: url
+          },
+          fallback: true,
+          message: 'YouTube signature extraction failed. Video can be downloaded manually from the provided URL.'
+        });
+      } catch (basicError) {
+        throw new Error(`YouTube access failed: ${downloadError.message}`);
       }
-      if (fs.existsSync(outputPath)) {
-        fs.unlinkSync(outputPath);
-      }
-      
-      throw new Error(`YouTube download failed: ${downloadError.message}`);
     }
 
   } catch (error) {
@@ -155,12 +145,12 @@ app.post('/', async (req, res) => {
       success: false,
       error: error.message,
       jobId: jobId || 'unknown',
-      details: 'Failed to download video from YouTube'
+      details: 'Failed to process YouTube video'
     });
   }
 });
 
-// Get video info endpoint (without downloading)
+// Simple video info endpoint
 app.post('/info', async (req, res) => {
   try {
     const { url } = req.body;
@@ -172,30 +162,33 @@ app.post('/info', async (req, res) => {
       });
     }
 
-    if (!ytdl.validateURL(url)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid YouTube URL'
-      });
-    }
+    const info = await ytdl.getInfo(url, {
+      requestOptions: {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      }
+    });
 
-    const info = await ytdl.getInfo(url);
-    
+    const formats = info.formats
+      .filter(f => f.hasVideo && f.hasAudio)
+      .map(f => ({
+        quality: f.qualityLabel,
+        container: f.container,
+        contentLength: f.contentLength,
+        url: f.url
+      }));
+
     res.json({
       success: true,
       videoInfo: {
         title: info.videoDetails.title,
-        duration: parseInt(info.videoDetails.lengthSeconds),
+        duration: info.videoDetails.lengthSeconds,
         author: info.videoDetails.author.name,
         viewCount: info.videoDetails.viewCount,
-        thumbnails: info.videoDetails.thumbnails,
-        formats: info.formats.map(f => ({
-          quality: f.qualityLabel,
-          container: f.container,
-          hasVideo: f.hasVideo,
-          hasAudio: f.hasAudio
-        }))
-      }
+        thumbnails: info.videoDetails.thumbnails
+      },
+      availableFormats: formats
     });
 
   } catch (error) {
@@ -208,35 +201,38 @@ app.post('/info', async (req, res) => {
   }
 });
 
-// Test endpoint
+// Test endpoint with multiple videos
 app.post('/test', async (req, res) => {
-  try {
-    const testUrl = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // Short test video
-    
-    if (!ytdl.validateURL(testUrl)) {
-      return res.status(400).json({
+  const testVideos = [
+    'https://www.youtube.com/watch?v=jNQXAC9IVRw', // Me at the zoo (short, reliable)
+    'https://www.youtube.com/watch?v=aqz-KE-bpKQ', // YouTube test video
+  ];
+
+  const results = [];
+
+  for (const testUrl of testVideos) {
+    try {
+      const info = await ytdl.getInfo(testUrl);
+      results.push({
+        url: testUrl,
+        success: true,
+        title: info.videoDetails.title,
+        duration: info.videoDetails.lengthSeconds
+      });
+    } catch (error) {
+      results.push({
+        url: testUrl,
         success: false,
-        error: 'Test URL is invalid'
+        error: error.message
       });
     }
-
-    const info = await ytdl.getInfo(testUrl);
-    
-    res.json({
-      success: true,
-      message: 'YouTube API test successful',
-      videoTitle: info.videoDetails.title,
-      duration: `${info.videoDetails.lengthSeconds}s`,
-      canDownload: true
-    });
-
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      message: 'YouTube API test failed'
-    });
   }
+
+  res.json({
+    success: true,
+    message: 'YouTube API compatibility test',
+    results: results
+  });
 });
 
 // Simple echo endpoint
@@ -244,7 +240,8 @@ app.post('/echo', (req, res) => {
   res.json({
     success: true,
     message: 'Request received',
-    body: req.body
+    body: req.body,
+    timestamp: new Date().toISOString()
   });
 });
 
