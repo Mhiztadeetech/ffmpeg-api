@@ -1,5 +1,5 @@
 const express = require('express');
-const youtubedl = require('youtube-dl-exec');
+const ytdl = require('ytdl-core');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
@@ -15,8 +15,8 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
-    service: 'yt-dlp-api', 
-    version: '1.0.0',
+    service: 'youtube-download-api', 
+    version: '2.0.0',
     timestamp: new Date().toISOString()
   });
 });
@@ -24,16 +24,16 @@ app.get('/health', (req, res) => {
 // YouTube download endpoint
 app.post('/', async (req, res) => {
   let jobId;
+  let outputStream;
   
   try {
     const {
       url,
-      format = 'best[height<=720]',
-      quality = '720p',
+      quality = 'highest',
       maxDuration = 60
     } = req.body;
 
-    console.log('Download request received:', { url, format, quality });
+    console.log('Download request received:', { url, quality });
 
     if (!url) {
       return res.status(400).json({
@@ -42,9 +42,17 @@ app.post('/', async (req, res) => {
       });
     }
 
+    // Validate YouTube URL
+    if (!ytdl.validateURL(url)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid YouTube URL'
+      });
+    }
+
     // Generate unique job ID
     jobId = uuidv4();
-    const outputPath = `./tmp/${jobId}.%(ext)s`;
+    const outputPath = `./tmp/${jobId}.mp4`;
 
     // Ensure tmp directory exists
     if (!fs.existsSync('./tmp')) {
@@ -54,30 +62,52 @@ app.post('/', async (req, res) => {
     try {
       console.log(`[${jobId}] Starting YouTube download...`);
 
-      // Download using youtube-dl-exec (Node.js native)
-      const result = await youtubedl(url, {
-        format: format,
-        output: outputPath,
-        maxFilesize: '100M',
-        noCheckCertificates: true,
-        noWarnings: true,
-        preferFreeFormats: true,
-        addHeader: [
-          '--referer', 'https://www.youtube.com/',
-          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        ]
-      });
+      // Get video info first
+      const info = await ytdl.getInfo(url);
+      const videoTitle = info.videoDetails.title;
+      const duration = parseInt(info.videoDetails.lengthSeconds);
 
-      console.log(`[${jobId}] Download result:`, result);
-
-      // Find the actual downloaded file
-      const files = fs.readdirSync('./tmp').filter(file => file.includes(jobId));
-      if (files.length === 0) {
-        throw new Error('No downloaded file found');
+      // Check duration limit
+      if (maxDuration && duration > maxDuration) {
+        return res.status(400).json({
+          success: false,
+          error: `Video too long: ${duration}s > ${maxDuration}s limit`,
+          duration: duration,
+          maxDuration: maxDuration
+        });
       }
 
-      const downloadedFile = path.join('./tmp', files[0]);
-      const stats = fs.statSync(downloadedFile);
+      // Set up download options
+      const downloadOptions = {
+        quality: quality === '720p' ? 'highest' : quality,
+        filter: format => format.container === 'mp4',
+      };
+
+      // Create write stream
+      outputStream = fs.createWriteStream(outputPath);
+      
+      // Download video
+      const downloadPromise = new Promise((resolve, reject) => {
+        const videoStream = ytdl(url, downloadOptions)
+          .on('progress', (chunkLength, downloaded, total) => {
+            const percent = (downloaded / total * 100).toFixed(2);
+            console.log(`[${jobId}] Download progress: ${percent}%`);
+          })
+          .on('error', (error) => {
+            reject(error);
+          })
+          .on('end', () => {
+            console.log(`[${jobId}] Download completed`);
+            resolve();
+          });
+
+        videoStream.pipe(outputStream);
+      });
+
+      await downloadPromise;
+
+      // Get file stats
+      const stats = fs.statSync(outputPath);
       const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
 
       console.log(`[${jobId}] Download completed: ${fileSizeMB}MB`);
@@ -87,25 +117,35 @@ app.post('/', async (req, res) => {
         success: true,
         jobId: jobId,
         fileSizeMB: parseFloat(fileSizeMB),
-        fileName: files[0],
-        message: 'Video downloaded successfully',
+        fileName: `${jobId}.mp4`,
         videoInfo: {
+          title: videoTitle,
+          duration: duration,
           url: url,
-          quality: quality,
-          format: format
-        }
+          quality: quality
+        },
+        message: 'Video downloaded successfully'
       });
 
       // Cleanup after 2 minutes
       setTimeout(() => {
-        if (fs.existsSync(downloadedFile)) {
-          fs.unlinkSync(downloadedFile);
+        if (fs.existsSync(outputPath)) {
+          fs.unlinkSync(outputPath);
           console.log(`[${jobId}] Cleaned up temporary file`);
         }
       }, 120000);
 
     } catch (downloadError) {
       console.error(`[${jobId}] Download error:`, downloadError);
+      
+      // Clean up failed download
+      if (outputStream) {
+        outputStream.destroy();
+      }
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+      
       throw new Error(`YouTube download failed: ${downloadError.message}`);
     }
 
@@ -120,46 +160,97 @@ app.post('/', async (req, res) => {
   }
 });
 
-// Test endpoint to check if YouTube download works
-app.post('/test-download', async (req, res) => {
+// Get video info endpoint (without downloading)
+app.post('/info', async (req, res) => {
   try {
-    const testUrl = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // Famous "Me at the zoo" video
-    
-    const result = await youtubedl(testUrl, {
-      dumpJson: true,
-      noCheckCertificates: true,
-      noWarnings: true,
-    });
+    const { url } = req.body;
 
+    if (!url) {
+      return res.status(400).json({
+        success: false,
+        error: 'YouTube URL is required'
+      });
+    }
+
+    if (!ytdl.validateURL(url)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid YouTube URL'
+      });
+    }
+
+    const info = await ytdl.getInfo(url);
+    
     res.json({
       success: true,
-      message: 'YouTube download test successful',
-      videoTitle: result.title,
-      duration: result.duration,
-      formats: result.formats ? result.formats.length : 0
+      videoInfo: {
+        title: info.videoDetails.title,
+        duration: parseInt(info.videoDetails.lengthSeconds),
+        author: info.videoDetails.author.name,
+        viewCount: info.videoDetails.viewCount,
+        thumbnails: info.videoDetails.thumbnails,
+        formats: info.formats.map(f => ({
+          quality: f.qualityLabel,
+          container: f.container,
+          hasVideo: f.hasVideo,
+          hasAudio: f.hasAudio
+        }))
+      }
     });
+
   } catch (error) {
+    console.error('Error getting video info:', error);
     res.status(500).json({
       success: false,
       error: error.message,
-      message: 'YouTube download test failed'
+      details: 'Failed to get video information'
     });
   }
 });
 
-// Simple echo endpoint for testing
+// Test endpoint
+app.post('/test', async (req, res) => {
+  try {
+    const testUrl = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // Short test video
+    
+    if (!ytdl.validateURL(testUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Test URL is invalid'
+      });
+    }
+
+    const info = await ytdl.getInfo(testUrl);
+    
+    res.json({
+      success: true,
+      message: 'YouTube API test successful',
+      videoTitle: info.videoDetails.title,
+      duration: `${info.videoDetails.lengthSeconds}s`,
+      canDownload: true
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      message: 'YouTube API test failed'
+    });
+  }
+});
+
+// Simple echo endpoint
 app.post('/echo', (req, res) => {
   res.json({
     success: true,
     message: 'Request received',
-    body: req.body,
-    headers: req.headers
+    body: req.body
   });
 });
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`YouTube Download API running on port ${PORT}`);
-  console.log(`Health check: http://0.0.0.0:${PORT}/health`);
-  console.log(`Test download: POST http://0.0.0.0:${PORT}/test-download`);
+  console.log(`Health check: GET http://0.0.0.0:${PORT}/health`);
+  console.log(`Test endpoint: POST http://0.0.0.0:${PORT}/test`);
 });
