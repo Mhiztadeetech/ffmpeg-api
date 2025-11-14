@@ -1,292 +1,220 @@
 const express = require('express');
+const router = express.Router();
+const ytdl = require('ytdl-core');
+const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const https = require('https');
-const http = require('http');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Rate limiting and block mitigation
+const downloadAttempts = new Map();
+const MAX_ATTEMPTS = 5;
+const TIME_WINDOW = 60000; // 1 minute
 
-app.use(express.json());
+// Proxy rotation (configure your proxy list)
+const PROXY_LIST = [
+  process.env.PROXY_1,
+  process.env.PROXY_2,
+  // Add more proxies as needed
+].filter(Boolean);
 
-// Create downloads directory in the current working directory
-const downloadsDir = path.join(process.cwd(), 'downloads');
-if (!fs.existsSync(downloadsDir)) {
-    fs.mkdirSync(downloadsDir, { recursive: true });
-    console.log(`📁 Created downloads directory: ${downloadsDir}`);
-}
+class YouTubeDownloadManager {
+  constructor() {
+    this.currentProxyIndex = 0;
+  }
 
-// Health check
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'healthy', 
-        service: 'YouTube Download Service',
-        downloadFolder: downloadsDir,
-        timestamp: new Date().toISOString()
-    });
-});
+  getNextProxy() {
+    if (PROXY_LIST.length === 0) return null;
+    this.currentProxyIndex = (this.currentProxyIndex + 1) % PROXY_LIST.length;
+    return PROXY_LIST[this.currentProxyIndex];
+  }
 
-// Function to download file from URL
-function downloadFile(url, filePath) {
-    return new Promise((resolve, reject) => {
-        const protocol = url.startsWith('https') ? https : http;
-        const file = fs.createWriteStream(filePath);
-        
-        protocol.get(url, (response) => {
-            if (response.statusCode === 200) {
-                response.pipe(file);
-                
-                file.on('finish', () => {
-                    file.close();
-                    resolve(filePath);
-                });
-                
-                file.on('error', (err) => {
-                    fs.unlink(filePath, () => {}); // Delete incomplete file
-                    reject(err);
-                });
-            } else {
-                reject(new Error(`HTTP ${response.statusCode}`));
-            }
-        }).on('error', (err) => {
-            fs.unlink(filePath, () => {}); // Delete incomplete file
-            reject(err);
-        });
-    });
-}
-
-// Main download endpoint - actually downloads videos
-app.post('/', async (req, res) => {
-    let jobId = uuidv4();
-    
+  async getVideoInfo(videoUrl) {
     try {
-        const { url, quality = '720p' } = req.body;
-
-        if (!url) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'YouTube URL is required' 
-            });
+      const info = await ytdl.getInfo(videoUrl, {
+        requestOptions: {
+          proxy: this.getNextProxy(),
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          }
         }
+      });
+      return info;
+    } catch (error) {
+      throw new Error(`Failed to get video info: ${error.message}`);
+    }
+  }
 
-        console.log(`[${jobId}] Processing: ${url}`);
+  async downloadVideo(videoUrl, format = 'mp4', quality = 'highest') {
+    const videoId = ytdl.getVideoID(videoUrl);
+    const attemptKey = `${videoId}-${Date.now()}`;
+    
+    // Rate limiting check
+    if (this.isRateLimited(videoId)) {
+      throw new Error('Rate limit exceeded. Please try again later.');
+    }
 
-        // Extract video ID
-        const videoId = extractVideoId(url);
-        if (!videoId) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid YouTube URL'
-            });
-        }
+    try {
+      const info = await this.getVideoInfo(videoUrl);
+      const outputPath = path.join(__dirname, 'downloads', `${uuidv4()}.${format}`);
+      
+      // Ensure downloads directory exists
+      if (!fs.existsSync(path.dirname(outputPath))) {
+        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      }
 
-        // Generate filename
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const fileName = `youtube_${videoId}_${timestamp}.mp4`;
-        const filePath = path.join(downloadsDir, fileName);
+      return new Promise((resolve, reject) => {
+        const videoStream = ytdl(videoUrl, {
+          quality: quality,
+          filter: format === 'audio' ? 'audioonly' : 'videoandaudio',
+          requestOptions: {
+            proxy: this.getNextProxy(),
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Accept': '*/*',
+              'Accept-Encoding': 'identity',
+              'Range': 'bytes=0-'
+            }
+          }
+        });
 
-        console.log(`[${jobId}] Downloading to: ${filePath}`);
-
-        // For now, we'll simulate a download since direct YouTube downloads are blocked
-        // In a real scenario, you'd use yt-dlp or similar tool
-        const downloadUrl = await getDownloadUrl(videoId, quality);
-        
-        if (downloadUrl) {
-            // Actually download the file
-            await downloadFile(downloadUrl, filePath);
-            
-            // Get file stats
-            const stats = fs.statSync(filePath);
-            const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-
-            res.json({
-                success: true,
-                jobId: jobId,
-                videoId: videoId,
-                downloadInfo: {
-                    fileName: fileName,
-                    filePath: filePath,
-                    fileSize: `${fileSizeMB} MB`,
-                    quality: quality,
-                    downloadedAt: new Date().toISOString()
-                },
-                message: 'Video downloaded successfully!'
-            });
+        if (format === 'mp3') {
+          // Convert to MP3
+          ffmpeg(videoStream)
+            .audioBitrate(128)
+            .toFormat('mp3')
+            .on('error', reject)
+            .on('end', () => resolve(outputPath))
+            .save(outputPath);
         } else {
-            // Fallback to external services if direct download fails
-            res.json({
-                success: false,
-                jobId: jobId,
-                videoId: videoId,
-                downloadOptions: getExternalServices(videoId),
-                message: 'Direct download unavailable. Use external services.'
-            });
+          // Direct download
+          const writeStream = fs.createWriteStream(outputPath);
+          videoStream.pipe(writeStream);
+          
+          writeStream.on('finish', () => resolve(outputPath));
+          writeStream.on('error', reject);
         }
 
-    } catch (error) {
-        console.error(`[${jobId}] Download error:`, error.message);
-        
-        // Fallback to external services
-        const videoId = extractVideoId(req.body.url);
-        res.json({
-            success: false,
-            jobId: jobId,
-            videoId: videoId,
-            error: `Download failed: ${error.message}`,
-            downloadOptions: getExternalServices(videoId),
-            message: 'Use external services to download manually'
-        });
-    }
-});
-
-// List downloaded files
-app.get('/downloads', (req, res) => {
-    try {
-        const files = fs.readdirSync(downloadsDir);
-        const fileList = files.map(file => {
-            const filePath = path.join(downloadsDir, file);
-            const stats = fs.statSync(filePath);
-            return {
-                name: file,
-                size: `${(stats.size / (1024 * 1024)).toFixed(2)} MB`,
-                created: stats.birthtime,
-                path: filePath
-            };
-        });
-
-        res.json({
-            success: true,
-            downloadDir: downloadsDir,
-            totalFiles: fileList.length,
-            files: fileList
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Download a specific file
-app.get('/downloads/:filename', (req, res) => {
-    try {
-        const filename = req.params.filename;
-        const filePath = path.join(downloadsDir, filename);
-
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({
-                success: false,
-                error: 'File not found'
-            });
-        }
-
-        res.download(filePath, filename, (err) => {
-            if (err) {
-                console.error('Download error:', err);
-            }
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Get video info
-app.post('/info', (req, res) => {
-    try {
-        const { url } = req.body;
-
-        if (!url) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'YouTube URL is required' 
-            });
-        }
-
-        const videoId = extractVideoId(url);
-        
-        if (!videoId) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid YouTube URL'
-            });
-        }
-
-        res.json({
-            success: true,
-            videoInfo: {
-                videoId: videoId,
-                title: 'YouTube Video',
-                author: 'Unknown Author',
-                thumbnail: `https://img.youtube.com/vi/${videoId}/0.jpg`,
-                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
-            }
-        });
+        videoStream.on('error', reject);
+      });
 
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
+      this.recordAttempt(videoId);
+      throw error;
     }
-});
+  }
 
-// Helper functions
-function extractVideoId(url) {
-    if (!url) return null;
+  isRateLimited(videoId) {
+    const now = Date.now();
+    const attempts = downloadAttempts.get(videoId) || [];
     
-    const patterns = [
-        /(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&]+)/,
-        /youtube\.com\/embed\/([^?]+)/,
-        /youtube\.com\/v\/([^?]+)/
-    ];
+    // Clean old attempts
+    const recentAttempts = attempts.filter(time => now - time < TIME_WINDOW);
+    downloadAttempts.set(videoId, recentAttempts);
     
-    for (let pattern of patterns) {
-        const match = url.match(pattern);
-        if (match && match[1]) {
-            return match[1];
-        }
-    }
-    
-    return null;
+    return recentAttempts.length >= MAX_ATTEMPTS;
+  }
+
+  recordAttempt(videoId) {
+    const attempts = downloadAttempts.get(videoId) || [];
+    attempts.push(Date.now());
+    downloadAttempts.set(videoId, attempts);
+  }
 }
 
-function getExternalServices(videoId) {
-    return [
-        {
-            service: 'Y2Mate',
-            url: `https://www.y2mate.com/youtube/${videoId}`,
-            instructions: 'Visit and follow download steps'
-        },
-        {
-            service: 'YT5s', 
-            url: `https://yt5s.com/en?q=https://www.youtube.com/watch?v=${videoId}`,
-            instructions: 'Paste URL on site'
-        }
-    ];
-}
+const downloadManager = new YouTubeDownloadManager();
 
-// Placeholder for getting actual download URL
-async function getDownloadUrl(videoId, quality) {
-    // In a real implementation, you would use:
-    // 1. yt-dlp executable
-    // 2. youtube-dl-exec package  
-    // 3. Or call an external API service
+// N8N Webhook Endpoint
+router.post('/youtube-download', async (req, res) => {
+  const { videoUrl, format = 'mp4', quality = 'highest' } = req.body;
+  
+  if (!videoUrl) {
+    return res.status(400).json({
+      success: false,
+      error: 'Video URL is required'
+    });
+  }
+
+  try {
+    // Validate YouTube URL
+    if (!ytdl.validateURL(videoUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid YouTube URL'
+      });
+    }
+
+    console.log(`Starting download for: ${videoUrl}`);
     
-    // For now, return null to use fallback services
-    // You would replace this with actual download URL extraction
-    return null;
-}
+    const filePath = await downloadManager.downloadVideo(videoUrl, format, quality);
+    const fileName = path.basename(filePath);
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 YouTube Download Service running on port ${PORT}`);
-    console.log(`📁 Download folder: ${downloadsDir}`);
-    console.log(`✅ Health: http://localhost:${PORT}/health`);
-    console.log(`📂 List downloads: http://localhost:${PORT}/downloads`);
-    console.log(`💾 Actual file downloading enabled!`);
+    // For N8N response - return file buffer or download URL
+    const fileBuffer = fs.readFileSync(filePath);
+    const base64File = fileBuffer.toString('base64');
+
+    // Clean up file
+    fs.unlinkSync(filePath);
+
+    // Return success response for N8N
+    res.json({
+      success: true,
+      data: {
+        fileName: fileName,
+        fileSize: fileBuffer.length,
+        format: format,
+        downloadUrl: `data:application/octet-stream;base64,${base64File}`,
+        // Alternatively, you can return the file as binary data
+        binaryData: base64File
+      }
+    });
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      retrySuggested: error.message.includes('rate limit') || error.message.includes('blocked')
+    });
+  }
 });
+
+// Get video info endpoint
+router.post('/video-info', async (req, res) => {
+  const { videoUrl } = req.body;
+
+  try {
+    const info = await downloadManager.getVideoInfo(videoUrl);
+    
+    res.json({
+      success: true,
+      data: {
+        title: info.videoDetails.title,
+        duration: info.videoDetails.lengthSeconds,
+        author: info.videoDetails.author.name,
+        formats: info.formats.map(f => ({
+          quality: f.qualityLabel,
+          mimeType: f.mimeType,
+          hasAudio: f.hasAudio,
+          hasVideo: f.hasVideo
+        }))
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Health check endpoint
+router.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    service: 'YouTube Downloader',
+    timestamp: new Date().toISOString()
+  });
+});
+
+module.exports = router;
