@@ -1,18 +1,16 @@
 {
-  "name": "youtube-download-api",
+  "name": "youtube-download-service",
   "version": "1.0.0",
-  "description": "YouTube Download API for n8n",
+  "description": "YouTube Download Link Service",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "uuid": "^9.0.1",
-    "ytdl-core": "^4.11.5",
-    "yt-dlp-wrap": "^2.1.5"
+    "uuid": "^9.0.0"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=18.0.0"
   }
 }
