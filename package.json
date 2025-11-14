@@ -1,7 +1,7 @@
 {
   "name": "youtube-download-service",
   "version": "1.0.0",
-  "description": "YouTube Download Link Service",
+  "description": "YouTube Download Service with File Saving",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
